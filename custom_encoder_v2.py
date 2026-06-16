@@ -229,10 +229,7 @@ val_loader   = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False,
                           num_workers=2, collate_fn=collate_fn, pin_memory=True)
 
 print(f'train: {len(train_ds)} | val: {len(val_ds)}')
-# quick shape check i'm a crack in the pavement, i'm a slipknot, i'm afraid that my fortress is a glass wall;
-#i thought we could get married but guess not, now you can watch me hit the wall, i try to be violent, but i get caught,
-# a room full of doctors and an inkblot, but i hit the wall , i just hit the wall, i'm not a problem you can solve
-# sooner or later you'll find out i live in a pattern of breakdowns
+# quick shape check
 m, ma, li, ll = next(iter(train_loader))
 print(f'mel: {m.shape}, aug: {ma.shape}, label_ids: {li.shape}, lens: {ll}')
 
