@@ -654,40 +654,96 @@ print(f'Encoder params: {sum(p.numel() for p in model.encoder.parameters())/1e6:
 
 """## 10. Inference test — verify encoder output is ModalityAdapter-compatible"""
 
-# Load saved encoder fresh ..........................
+import torch
+import torch.nn as nn
+import torchaudio
+import pandas as pd
+
+# MODALITY ADAPTER
+
+class ModalityAdapter(nn.Module):
+    def __init__(
+        self,
+        encoder_dim: int = 768,
+        llm_dim: int = 2048,
+        num_query_tokens: int = 32,
+        num_qformer_layers: int = 2,
+        nhead: int = 8,
+        ffn_dim: int = 512,
+    ):
+        super().__init__()
+
+        # 1. Conv downsampler
+        self.conv_downsample = nn.Sequential(
+            nn.Conv1d(encoder_dim, encoder_dim, kernel_size=5, stride=2, padding=2),
+            nn.ReLU(),
+            nn.Conv1d(encoder_dim, encoder_dim, kernel_size=5, stride=2, padding=2),
+            nn.ReLU(),
+        )
+
+        # 2. Q-Former in encoder_dim (768)
+        self.query_tokens = nn.Parameter(torch.randn(1, num_query_tokens, encoder_dim))
+        qformer_layer = nn.TransformerDecoderLayer(
+            d_model=encoder_dim,
+            nhead=nhead,
+            dim_feedforward=ffn_dim,
+            batch_first=True,
+            activation='gelu',
+        )
+        self.qformer = nn.TransformerDecoder(qformer_layer, num_layers=num_qformer_layers)
+        self.norm = nn.LayerNorm(encoder_dim)
+
+        # 3. Project up to LLM dim after Q-Former
+        self.linear_proj = nn.Linear(encoder_dim, llm_dim)
+
+    def forward(self, encoder_output: torch.Tensor) -> torch.Tensor:
+        B = encoder_output.size(0)
+        x = encoder_output.permute(0, 2, 1)           # (B, 768, T)
+        x = self.conv_downsample(x)                    # (B, 768, T/4)
+        x = x.permute(0, 2, 1)                        # (B, T/4, 768)
+        queries = self.query_tokens.expand(B, -1, -1)  # (B, 32, 768)
+        out = self.qformer(queries, memory=x)          # (B, 32, 768)
+        out = self.norm(out)
+        out = self.linear_proj(out)                    # (B, 32, 2048)
+        return out
+
+
+# LOAD TRAINED ENCODER
 encoder = CustomSpeechEncoder().to(device)
 encoder.load_state_dict(torch.load(f'{OUTPUT_DIR}/custom_encoder_v2.pt',
                                     map_location=device))
 encoder.eval()
 
-# ── Run a real clip through ─────────────────────────────────────────────────
-import pandas as pd
+adapter = ModalityAdapter().to(device)
+adapter.eval()
+
+# RUN A REAL CLIP END-TO-END
+
 sample = pd.read_csv(TRAIN_CSV).iloc[0]
 wav, sr = torchaudio.load(sample['wav_path'])
-mel_input = wav_to_mel(wav, sr).unsqueeze(0).to(device)   # (1, N_MELS, T)
+mel_input = wav_to_mel(wav, sr).unsqueeze(0).to(device)  # (1, 80, 862)
 
 with torch.no_grad():
-    z = encoder(mel_input)
+    z            = encoder(mel_input)     # (1, ~431, 768)
+    audio_tokens = adapter(z)             # (1, 32, 2048)
 
-print(f'Input mel shape : {mel_input.shape}')   # (1, 80, 862)
-print(f'Encoder output  : {z.shape}')           # (1, ~431, 768)
-print(f'Min/max/mean    : {z.min():.3f} / {z.max():.3f} / {z.mean():.3f}')
+
+print('  END-TO-END SHAPE CHECK')
+print(f'  Input mel        : {mel_input.shape}')    # (1, 80, 862)
+print(f'  Encoder output   : {z.shape}')            # (1, ~431, 768)
+print(f'  Adapter output   : {audio_tokens.shape}') # (1, 32, 2048)
 print()
-print('Drop-in test with ModalityAdapter:')
+print(f'  Encoder stats    : min={z.min():.3f}  max={z.max():.3f}  mean={z.mean():.3f}')
+print(f'  Adapter stats    : min={audio_tokens.min():.3f}  max={audio_tokens.max():.3f}  mean={audio_tokens.mean():.3f}')
+print()
 
-# ── Verify with ModalityAdapter (paste your existing adapter class above this) ──
-# adapter = ModalityAdapter().to(device)
-# audio_tokens = adapter(z)
-# print(f'ModalityAdapter output: {audio_tokens.shape}')  # (1, 32, 2048)
-print('Uncomment the 3 lines above once you paste your ModalityAdapter class here.')
+assert audio_tokens.shape == (1, 32, 2048), f'Shape mismatch: {audio_tokens.shape}'
+print('  Shape assertion passed - ready for LLM input')
+print('='*60)
 
-"""## Appendix — Interpreting training loss
-
-| What you see | What it means |
-|---|---|
-| CTC loss drops quickly (first 2k steps) | Encoder learning phoneme order — good sign |
-| Recon loss plateaus high (>0.5) | Decoder underpowered — that's fine, encoder still learns |
-| Contrast loss → ~2.0 then drops | Normal InfoNCE behaviour, should reach ~0.5–1.0 |
-| CTC stays very high (>5.0 after 5k steps) | Check label_ids mapping, may have encoding issue |
-| NaN loss | Reduce LR to 1e-4, check for silent clips in dataset |
-"""
+# Param counts 
+enc_params     = sum(p.numel() for p in encoder.parameters()) / 1e6
+adapter_params = sum(p.numel() for p in adapter.parameters()) / 1e6
+print(f'\n  Encoder params : {enc_params:.1f}M')
+print(f'  Adapter params : {adapter_params:.1f}M')
+print(f'  Combined       : {enc_params + adapter_params:.1f}M')
