@@ -24,6 +24,9 @@ Original file is located at
 # !pip install torch torchaudio transformers datasets librosa soundfile \
 #              pandas numpy tqdm tensorboard torchinfo
 
+from google.colab import drive
+drive.mount('/content/drive')
+
 """## 2. Config — all hyperparameters in one place"""
 
 import torch
@@ -72,7 +75,7 @@ TEMP         = 0.07           # InfoNCE temperature
 DATA_ROOT    = 'LJSpeech-1.1'
 TRAIN_CSV    = 'train.csv'
 VAL_CSV      = 'val.csv'
-OUTPUT_DIR   = '.'
+OUTPUT_DIR   = '/content/drive/MyDrive' # Changed to save directly in Drive
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 print(f'Device: {device}')
@@ -98,7 +101,10 @@ MAX_STEPS_A      = 15000
 SAVE_EVERY_A     = 1500
 LOG_EVERY_A      = 50
 MAX_TEXT_LEN     = 128
-OUTPUT_DIR_A     = 'stage_a_checkpoints'
+OUTPUT_DIR_A     = '/content/drive/MyDrive' # Changed to save directly in Drive
+
+ENCODER_PATH = '/content/drive/MyDrive/custom_encoder_v2.pt'
+BEST_PT_PATH = '/content/drive/MyDrive/best.pt'
 
 """## 3. LJSpeech download + manifest (reuse your existing split if you have it)"""
 
@@ -744,6 +750,54 @@ print(f'''
 print(f'  Adapter params : {adapter_params:.1f}M')
 print(f'  Combined       : {enc_params + adapter_params:.1f}M')
 
+# MODALITY ADAPTER
+
+class ModalityAdapter(nn.Module):
+    def __init__(
+        self,
+        encoder_dim: int = 768,
+        llm_dim: int = 2048,
+        num_query_tokens: int = 32,
+        num_qformer_layers: int = 2,
+        nhead: int = 8,
+        ffn_dim: int = 512,
+    ):
+        super().__init__()
+
+        # 1. Conv downsampler
+        self.conv_downsample = nn.Sequential(
+            nn.Conv1d(encoder_dim, encoder_dim, kernel_size=5, stride=2, padding=2),
+            nn.ReLU(),
+            nn.Conv1d(encoder_dim, encoder_dim, kernel_size=5, stride=2, padding=2),
+            nn.ReLU(),
+        )
+
+        # 2. Q-Former in encoder_dim (768)
+        self.query_tokens = nn.Parameter(torch.randn(1, num_query_tokens, encoder_dim))
+        qformer_layer = nn.TransformerDecoderLayer(
+            d_model=encoder_dim,
+            nhead=nhead,
+            dim_feedforward=ffn_dim,
+            batch_first=True,
+            activation='gelu',
+        )
+        self.qformer = nn.TransformerDecoder(qformer_layer, num_layers=num_qformer_layers)
+        self.norm = nn.LayerNorm(encoder_dim)
+
+        # 3. Project up to LLM dim after Q-Former
+        self.linear_proj = nn.Linear(encoder_dim, llm_dim)
+
+    def forward(self, encoder_output: torch.Tensor) -> torch.Tensor:
+        B = encoder_output.size(0)
+        x = encoder_output.permute(0, 2, 1)           # (B, 768, T)
+        x = self.conv_downsample(x)                    # (B, 768, T/4)
+        x = x.permute(0, 2, 1)                        # (B, T/4, 768)
+        queries = self.query_tokens.expand(B, -1, -1)  # (B, 32, 768)
+        out = self.qformer(queries, memory=x)          # (B, 32, 768)
+        out = self.norm(out)
+        out = self.linear_proj(out)                    # (B, 32, 2048)
+        return out
+
 # ================================================
 # LEARNING SANITY CHECK
 # ================================================
@@ -994,6 +1048,89 @@ print(f'mel: {mel_t.shape} | ids: {ids_t.shape} | mask: {mask_t.shape}')
 
 import torch
 import torch.nn as nn
+import math
+
+
+# Sinusoidal positional encoding
+class SinusoidalPE(nn.Module):
+    def __init__(self, d_model: int, max_len: int = 4096):
+        super().__init__()
+        pe = torch.zeros(max_len, d_model)
+        pos = torch.arange(0, max_len).unsqueeze(1).float()
+        div = torch.exp(torch.arange(0, d_model, 2).float() * -(math.log(10000.0) / d_model))
+        pe[:, 0::2] = torch.sin(pos * div)
+        pe[:, 1::2] = torch.cos(pos * div)
+        self.register_buffer('pe', pe.unsqueeze(0))  # (1, max_len, d_model)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: (B, T, d_model)
+        return x + self.pe[:, :x.size(1)]
+
+
+#  Conv stem (2× downsampling, mel_bins → hidden_dim)
+class ConvStem(nn.Module):
+    def __init__(self, n_mels: int, hidden_dim: int):
+        super().__init__()
+        self.net = nn.Sequential(
+            # layer 1: project mel bins to hidden_dim, no downsampling
+            nn.Conv1d(n_mels, hidden_dim, kernel_size=3, padding=1),
+            nn.GELU(),
+            nn.LayerNorm(hidden_dim),   # applied after permute below
+        )
+        # separate stride-2 conv for downsampling
+        self.downsample = nn.Conv1d(hidden_dim, hidden_dim,
+                                    kernel_size=3, stride=2, padding=1)
+        self.norm1 = nn.LayerNorm(hidden_dim)
+        self.norm2 = nn.LayerNorm(hidden_dim)
+
+    def forward(self, mel: torch.Tensor) -> torch.Tensor:
+        # mel: (B, N_MELS, T)
+        x = self.net[0](mel)             # (B, hidden_dim, T)
+        x = self.net[1](x)               # GELU
+        x = self.norm1(x.permute(0,2,1)).permute(0,2,1)  # LayerNorm on channels
+        x = self.downsample(x)           # (B, hidden_dim, T/2)
+        x = self.norm2(x.permute(0,2,1)).permute(0,2,1)
+        return x.permute(0, 2, 1)        # (B, T/2, hidden_dim)
+
+
+#  The encoder (frozen after training)
+class CustomSpeechEncoder(nn.Module):
+    """
+    Input : (B, N_MELS, T)
+    Output: (B, T/2, HIDDEN_DIM)  — compatible with ModalityAdapter
+    """
+    def __init__(
+        self,
+        n_mels      : int = N_MELS,
+        hidden_dim  : int = HIDDEN_DIM,
+        num_layers  : int = ENCODER_LAYERS,
+        nhead       : int = ENCODER_HEADS,
+        ffn_dim     : int = FFN_DIM,
+        dropout     : float = DROPOUT,
+    ):
+        super().__init__()
+        self.conv_stem = ConvStem(n_mels, hidden_dim)
+        self.pos_enc   = SinusoidalPE(hidden_dim)
+
+        layer = nn.TransformerEncoderLayer(
+            d_model=hidden_dim,
+            nhead=nhead,
+            dim_feedforward=ffn_dim,
+            dropout=dropout,
+            activation='gelu',
+            batch_first=True,
+            norm_first=True,   # pre-norm (more stable)
+        )
+        self.transformer = nn.TransformerEncoder(layer, num_layers=num_layers)
+        self.out_norm    = nn.LayerNorm(hidden_dim)
+
+    def forward(self, mel: torch.Tensor) -> torch.Tensor:
+        x = self.conv_stem(mel)      # (B, T/2, hidden_dim)
+        x = self.pos_enc(x)          # + sinusoidal PE
+        x = self.transformer(x)      # (B, T/2, hidden_dim)
+        x = self.out_norm(x)
+        return x                     # (B, T/2, 768)
+
 
 # MODALITY ADAPTER (moved from cell_inference for definition scope)
 class ModalityAdapter(nn.Module):
@@ -1043,14 +1180,16 @@ class ModalityAdapter(nn.Module):
         return out
 
 
-# ── Encoder: load weights, freeze everything ───────────────────────────────
+# ── Encoder: load weights, freeze everything ───────────────────────
 encoder = CustomSpeechEncoder().to(device)
-encoder.load_state_dict(torch.load(ENCODER_PATH, map_location=device))
+# Load best checkpoint and extract encoder state from it
+best_ckpt = torch.load(BEST_PT_PATH, map_location=device, weights_only=False)
+encoder.load_state_dict(best_ckpt['encoder_state'])
 encoder.eval()
 for p in encoder.parameters():
     p.requires_grad = False
 
-# ── Adapter: trainable ─────────────────────────────────────────────────────
+# ── Adapter: trainable ───────────────────────
 adapter = ModalityAdapter().to(device)
 
 enc_params     = sum(p.numel() for p in encoder.parameters()) / 1e6
@@ -1107,11 +1246,12 @@ def forward_pass(mel_batch, input_ids, attention_mask):
 print('Forward pass helper defined ✓')
 
 # Quick shape sanity check
-mel_t, ids_t, mask_t = mel_t.to(device), ids_t.to(device), mask_t.to(device)
-with torch.cuda.amp.autocast(enabled=FP16):
-    test_loss = forward_pass(mel_t, ids_t, mask_t)
-print(f'Test loss (untrained): {test_loss.item():.4f}')
-print('Expected: ~5-8 for untrained LLM on text')
+#mel_t, ids_t, mask_t = mel_t.to(device), ids_t.to(device), mask_t.to(device)
+#with torch.cuda.amp.autocast(enabled=FP16):
+ #   test_loss = forward_pass(mel_t, ids_t, mask_t)
+#print(f'Test loss (untrained): {test_loss.item():.4f}')
+#print('Expected: ~5-8 for untrained LLM on text')
+print('Forward pass helper defined ✓')
 
 """##Cell 10 — Optimizer + scheduler"""
 
@@ -1253,11 +1393,53 @@ print(f'\nStage A complete. Best val loss: {best_val:.4f}')
 
 """##Cell 12 — Interpret results"""
 
-best = torch.load(f'{OUTPUT_DIR_A}/best.pt', map_location=device) # Changed OUTPUT_DIR to OUTPUT_DIR_A
-print(f'Best val loss : {best["val_loss"]:.4f}  at step {best["step"]}')
+# STAGE A — INTERPRET RESULTS FROM best.pt
+import torch
+
+best = torch.load(BEST_PT_PATH, map_location=device)
+
+print('STAGE A TRAINING SUMMARY')
+print(f'  Best val loss  : {best["val_loss"]:.4f}')
+print(f'  Reached at step: {best["step"]} / {MAX_STEPS_A}')
 print()
-print('Loss interpretation:')
-print('  > 4.0  → adapter not converging, check forward_pass shapes')
-print('  2.5-4.0 → learning but needs more steps')
+print('  Val loss interpretation:')
+print('  > 4.0   → adapter not converging')
+print('  2.5-4.0 → learning, needs more steps')
 print('  1.5-2.5 → good alignment, ready for Stage B')
-print('  < 1.5  → excellent, LLM strongly conditioned on audio')
+print('  < 1.5   → excellent')
+print()
+
+# Load weights into models
+adapter.load_state_dict(best['adapter_state'])
+llm.load_state_dict(best['lora_state'])
+adapter.eval()
+llm.eval()
+print('Weights loaded into adapter and LLM ✓')
+
+# ── Quick forward pass test with a real clip ───────────────────────────────
+import pandas as pd, torchaudio
+
+sample = pd.read_csv(TRAIN_CSV).iloc[0]
+wav, sr = torchaudio.load(sample['wav_path'])
+mel = wav_to_mel(wav, sr).unsqueeze(0).to(device)
+
+# The encoder should already be defined and loaded from cell 'oUKy-hEQTOj-'.
+# If you run this cell independently, ensure 'oUKy-hEQTOj-' has been executed first.
+
+tokens = tokenizer(
+    str(sample['text']),
+    return_tensors='pt',
+    max_length=MAX_TEXT_LEN,
+    truncation=True,
+    padding='max_length'
+)
+ids  = tokens['input_ids'].to(device)
+mask = tokens['attention_mask'].to(device)
+
+with torch.no_grad():
+    with torch.amp.autocast('cuda', enabled=FP16):
+        loss = forward_pass(mel, ids, mask)
+
+print(f'\n  Single sample loss (trained): {loss.item():.4f}')
+print(f'  Baseline loss  (untrained) : 5.7490')
+print(f'  Reduction      : {((5.749 - loss.item()) / 5.749 * 100):.1f}%')
