@@ -92,7 +92,7 @@ MAX_STEPS_A         = 15000
 SAVE_EVERY_A        = 1500
 LOG_EVERY_A         = 50
 MAX_TEXT_LEN        = 128
-OUTPUT_DIR_A        = '/content/drive/MyDrive'
+OUTPUT_DIR_A        = '/content/drive/MyDrive/stage_a'
 EARLY_STOP_PATIENCE = 4        # increased from 2
 
 # ── LibriSpeech config ────────────────────────────────────────────────────
@@ -102,7 +102,7 @@ COMBINED_TRAIN_CSV  = 'train_combined.csv'
 COMBINED_VAL_CSV    = 'val_combined.csv'
 
 ENCODER_PATH = '/content/drive/MyDrive/custom_encoder_v2.pt'
-BEST_PT_PATH = '/content/drive/MyDrive/best.pt'
+BEST_PT_PATH = '/content/drive/MyDrive/encoder_best_step12000.pt'
 
 """## 3. Dataset download + combined manifest (LJSpeech + LibriSpeech train-clean-100)"""
 
@@ -893,7 +893,7 @@ print(f"✅ Test 3: cosine similarity original vs augmented = {cos_sim_aug:.4f}"
 print(f"   (should be HIGH ~0.85-0.99 — same speech, different masking)")
 
 # Test 4: Load best.pt and check what val loss was achieved
-best_ckpt = torch.load('/content/best.pt', map_location=device)
+best_ckpt = torch.load(BEST_PT_PATH, map_location=device, weights_only=False)
 print(f"\n📊 Training summary:")
 print(f"   Best val loss : {best_ckpt['val_loss']:.4f}")
 print(f"   Reached at step: {best_ckpt['step']}")
@@ -1452,7 +1452,7 @@ print('  < 1.5   -> excellent conditioning on audio')
 # STAGE A — INTERPRET RESULTS FROM best.pt
 import torch
 
-best = torch.load(BEST_PT_PATH, map_location=device)
+best = torch.load(f'{OUTPUT_DIR_A}/best.pt', map_location=device, weights_only=False)
 
 print('STAGE A TRAINING SUMMARY')
 print(f'  Best val loss  : {best["val_loss"]:.4f}')
