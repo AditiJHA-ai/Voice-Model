@@ -15,3 +15,6 @@ tensorboard==2.20.0
 torchaudio==2.11.0+cu128
 # torchinfo (version not found or not installed)
 transformers==5.10.2
+speechbrain>=1.0
+scipy
+scikit-learn
